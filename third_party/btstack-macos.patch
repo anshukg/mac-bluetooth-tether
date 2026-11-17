@@ -1,0 +1,155 @@
+diff --git a/src/classic/rfcomm.c b/src/classic/rfcomm.c
+index 89060e709..26977da9d 100644
+--- a/src/classic/rfcomm.c
++++ b/src/classic/rfcomm.c
+@@ -2399,11 +2399,9 @@ uint8_t rfcomm_send(uint16_t rfcomm_cid, uint8_t *data, uint16_t len){
+ 
+     (void)memcpy(rfcomm_payload, data, len);
+     status = rfcomm_send_prepared(rfcomm_cid, len);
+-
+-    if (status != ERROR_CODE_SUCCESS){
+-        rfcomm_release_packet_buffer();
+-    }
+-
++    /* rfcomm_send_prepared releases the reserved buffer on every success and
++     * error path.  Releasing it again here aborts on a transient lower-layer
++     * send error. */
+     return status;
+ }
+ 
+diff --git a/src/hci.c b/src/hci.c
+index 9b16d90df..f79317c83 100644
+--- a/src/hci.c
++++ b/src/hci.c
+@@ -432,6 +432,44 @@ hci_connection_t * hci_connection_for_bd_addr_and_type(const bd_addr_t  addr, bd
+     return NULL;
+ }
+ 
++uint8_t hci_adopt_classic_connection(const bd_addr_t addr,
++                                     hci_con_handle_t con_handle,
++                                     hci_role_t role,
++                                     bool authenticated,
++                                     bool encrypted){
++#ifdef ENABLE_CLASSIC
++    if (hci_stack == NULL || hci_stack->state != HCI_STATE_OFF ||
++        con_handle > 0x0effu || !authenticated || !encrypted) {
++        return ERROR_CODE_COMMAND_DISALLOWED;
++    }
++    if (hci_connection_for_handle(con_handle) != NULL ||
++        hci_connection_for_bd_addr_and_type(addr, BD_ADDR_TYPE_ACL) != NULL) {
++        return ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS;
++    }
++
++    hci_connection_t * connection =
++        create_connection_for_bd_addr_and_type(addr, BD_ADDR_TYPE_ACL, role);
++    if (connection == NULL) return BTSTACK_MEMORY_ALLOC_FAILED;
++
++    connection->con_handle = con_handle;
++    connection->state = OPEN;
++    connection->encryption_key_size = 0;
++    connection->encryption_key_type =
++        UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192;
++    connection->authentication_flags |= AUTH_FLAG_CONNECTION_AUTHENTICATED;
++    connection->bonding_flags |= BONDING_SEND_READ_ENCRYPTION_KEY_SIZE;
++    hci_remote_features_query(con_handle);
++    return ERROR_CODE_SUCCESS;
++#else
++    UNUSED(addr);
++    UNUSED(con_handle);
++    UNUSED(role);
++    UNUSED(authenticated);
++    UNUSED(encrypted);
++    return ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE;
++#endif
++}
++
+ inline static void hci_connection_clear_authentication_flags(hci_connection_t * conn, hci_authentication_flags_t flags){
+     conn->authentication_flags = (hci_authentication_flags_t)(conn->authentication_flags & ~flags);
+     log_info("Authentication flags clear 0x%04x => 0x%04x for %s", flags, conn->authentication_flags, bd_addr_to_str(conn->address));
+@@ -2246,6 +2284,7 @@ static void hci_initializing_run(void){
+ 
+         // only sent if ENABLE_SCO_OVER_HCI is defined
+         case HCI_INIT_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE:
++#ifndef DISABLE_HCI_SYNCHRONOUS_FLOW_CONTROL
+             // skip write synchronous flow control if not supported
+             if (hci_classic_supported()
+             && hci_command_supported(SUPPORTED_HCI_COMMAND_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE)) {
+@@ -2253,6 +2292,7 @@ static void hci_initializing_run(void){
+                 hci_send_cmd(&hci_write_synchronous_flow_control_enable, 1); // SCO tracking enabled
+                 break;
+             }
++#endif
+             /* fall through */
+ 
+         case HCI_INIT_WRITE_DEFAULT_ERRONEOUS_DATA_REPORTING:
+@@ -3200,7 +3240,9 @@ static void handle_command_complete_event(uint8_t * packet, uint16_t size){
+ #ifdef ENABLE_CLASSIC
+         case HCI_OPCODE_HCI_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE:
+             if (status) return;
++#ifndef DISABLE_HCI_SYNCHRONOUS_FLOW_CONTROL
+             hci_stack->synchronous_flow_control_enabled = 1;
++#endif
+             break;
+         case HCI_OPCODE_HCI_READ_ENCRYPTION_KEY_SIZE:
+             if (size < (OFFSET_OF_DATA_IN_COMMAND_COMPLETE + 3u)) break;
+@@ -6180,6 +6222,24 @@ int hci_power_control(HCI_POWER_MODE power_mode){
+     return 0;
+ }
+ 
++int hci_power_control_on_without_reset(void){
++    if (hci_stack == NULL || hci_stack->state != HCI_STATE_OFF) {
++        return ERROR_CODE_COMMAND_DISALLOWED;
++    }
++
++    btstack_run_loop_remove_timer(&hci_stack->timeout);
++    int err = hci_power_control_on();
++    if (err != 0) return err;
++
++    hci_stack->num_cmd_packets = 1;
++    hci_stack->hci_packet_buffer_reserved = false;
++    hci_stack->state = HCI_STATE_INITIALIZING;
++    hci_stack->substate = HCI_INIT_SEND_READ_LOCAL_VERSION_INFORMATION;
++    hci_emit_state();
++    hci_run();
++    return ERROR_CODE_SUCCESS;
++}
++
+ 
+ static void hci_halting_run(void) {
+ 
+diff --git a/src/hci.h b/src/hci.h
+index b7ae80134..74f1806ed 100644
+--- a/src/hci.h
++++ b/src/hci.h
+@@ -1546,6 +1546,13 @@ void hci_le_set_default_data_length(uint8_t tx_octets, uint16_t tx_time);
+  */
+ int  hci_power_control(HCI_POWER_MODE power_mode);
+ 
++/**
++ * @brief Open an already configured controller without sending HCI Reset.
++ * This is for a direct host handoff where live controller links must survive.
++ * @return 0 if startup began, otherwise error
++ */
++int hci_power_control_on_without_reset(void);
++
+ /**
+  * @brief Shutdown HCI
+  */
+@@ -1761,6 +1768,16 @@ hci_connection_t * hci_connection_for_handle(hci_con_handle_t con_handle);
+  */
+ hci_connection_t * hci_connection_for_bd_addr_and_type(const bd_addr_t addr, bd_addr_type_t addr_type);
+ 
++/**
++ * Register a live, authenticated Classic ACL that another host stack opened
++ * before control of the same controller was handed to BTstack.
++ */
++uint8_t hci_adopt_classic_connection(const bd_addr_t addr,
++                                     hci_con_handle_t con_handle,
++                                     hci_role_t role,
++                                     bool authenticated,
++                                     bool encrypted);
++
+ /**
+  * Check if outgoing packet buffer is reserved. Used for internal checks in l2cap.c
+  * @return true if packet buffer is reserved
+

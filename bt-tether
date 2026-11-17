@@ -1,0 +1,929 @@
+#!/bin/zsh
+# bt-tether — Bluetooth tethering for Apple silicon Macs, through an Android phone.
+#
+# Once installed (./install.sh), nothing needs typing: when the Mac has no other network and
+# the phone is nearby, it goes online through the phone over Bluetooth by itself, and when
+# Wi-Fi is back it switches back and your Bluetooth devices and their sound return.
+#
+#   bt-tether status          what is happening now
+#   bt-tether only            tethering on, checked, then Wi-Fi off (Bluetooth-only mode)
+#   bt-tether wifi            Wi-Fi back on, then tethering off
+#   bt-tether start | stop    tethering on or off by hand
+#   bt-tether auto on|off     automatic switching on or off
+#   bt-tether test            one-minute self-test with the phone; installs nothing
+#   bt-tether doctor          checks this Mac and the phone; changes nothing
+#   bt-tether repair-pairing  removes and redoes the Mac's own pairing with the phone
+#   bt-tether uninstall [--keep-pairing]   removes everything the installer added
+#
+# One radio, one owner: while tethering is on, this tool runs the Mac's Bluetooth chip, so
+# headphones, mice and other Bluetooth devices pause and the Bluetooth switch shows off.
+# They come back by themselves when tethering ends.
+
+set -u
+SELF="${0:A}"
+HERE="${SELF:h}"
+BIN="$HERE/build"
+PANHOST="$BIN/panhost"
+TAP="$BIN/tap"
+PAIR="$BIN/pair"
+AUDIO="$BIN/audioroute"
+BAR="$BIN/tetherbar"
+LAUNCHER="$BIN/BluetoothTether"
+POWER="$BIN/BluetoothPowerControl"
+ADDRESS_PROBE="$BIN/SkywalkHCIAddressProbe"
+NETROOT="$HERE/net-root.sh"
+
+STATE="$HOME/Library/Application Support/bt-tether"
+CONFIG="$STATE/config"
+LOG="$STATE/panhost.log"
+PIDFILE="$STATE/panhost.pid"
+PROBE_PIDFILE="$STATE/probe.pid"
+DB="$STATE/state.tlv"
+RESTORE_LOG="$STATE/restore.log"
+CONNECTED_FILE="$STATE/connected-before.txt"
+OUTPUT_FILE="$STATE/output-before.txt"
+ACTIVE_MARK="$STATE/active"
+WIFI_MARK="$STATE/wifi-off-by-us"
+BAR_PID="$STATE/bar.pid"
+WATCH_PID="$STATE/watch.pid"
+AUTO_PID="$STATE/auto.pid"
+AUTO_DISABLED="$STATE/auto-disabled"
+AUTO_LOG="$STATE/auto.log"
+PRETEND_OFFLINE="$STATE/pretend-offline"   # test aid: makes automatic mode treat the Mac as offline
+APP_DIR="$STATE/app"
+APP_BUNDLE="$STATE/Bluetooth Tether.app"
+
+ROOT_DIR="/Library/Application Support/bt-tether"
+LINK_STATE="$ROOT_DIR/link-state"
+BUNDLE_ID="com.anshu.bt-tether"
+BOOT_LABEL="$BUNDLE_ID.net"
+LINK_LABEL="$BUNDLE_ID.link"
+AGENT_LABEL="$BUNDLE_ID.auto"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+CLI_LINK="/usr/local/bin/bt-tether"
+
+mkdir -p "$STATE"
+
+# Settings written by install.sh: the phone, this Mac's own Bluetooth address, the separate
+# address the tether uses, the virtual network port pair, and the Wi-Fi port.
+PHONE="" PHONE_NAME="" FACTORY="" TETHER="" HOST_IF="" TAP_IF="" WIFI_IF=""
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+
+say() { print -r -- "[bt-tether] $*"; }
+
+notify() {
+    /usr/bin/osascript -e "display notification \"$1\" with title \"Bluetooth tethering\"" >/dev/null 2>&1 || true
+}
+
+need_config() {
+    if [[ -z "$PHONE" || -z "$FACTORY" || -z "$TETHER" || -z "$HOST_IF" || -z "$TAP_IF" ]]; then
+        say "not set up yet: run ./install.sh in the downloaded folder"
+        exit 1
+    fi
+}
+
+usage() { sed -n '2,20p' "$SELF" | sed -E 's/^# ?//'; }
+
+# ---- Bluetooth chip -----------------------------------------------------------------------
+
+controller_field() {   # Address | State | Chipset | Transport of the Mac's own controller
+    /usr/sbin/system_profiler SPBluetoothDataType 2>/dev/null |
+        awk -v key="$1:" '/Bluetooth Controller:/{f=1} f && $1==key {print $2; exit}'
+}
+controller_address() { controller_field Address; }
+
+wait_for_factory_address() {
+    local _
+    for _ in {1..80}; do
+        [[ "$(controller_address)" == "$FACTORY" ]] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+pid_from() {   # prints the pid in that file if it is a running panhost
+    local pid=""
+    [[ -f "$1" ]] && pid=$(<"$1")
+    if [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null &&
+       [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == *panhost ]]; then
+        print -r -- "$pid"
+    fi
+}
+host_pid() { pid_from "$PIDFILE"; }
+probe_pid() { pid_from "$PROBE_PIDFILE"; }
+
+stop_pidfile() {
+    local pid; pid=$(pid_from "$1")
+    if [[ -n "$pid" ]]; then
+        kill -TERM "$pid" 2>/dev/null
+        local _
+        for _ in {1..70}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$pid" 2>/dev/null && { kill -KILL "$pid" 2>/dev/null; sleep 0.3; }
+    fi
+    rm -f "$1"
+}
+
+# ---- helpers around tethering -------------------------------------------------------------
+
+# Tells the root helper to start ("up") or clear ("down") the address on the network port.
+set_link() {
+    [[ -w "$LINK_STATE" ]] || return 1
+    print -r -- "$1" >"$LINK_STATE"
+}
+
+net_ready() {
+    /sbin/ifconfig "$HOST_IF" >/dev/null 2>&1 && /sbin/ifconfig "$TAP_IF" >/dev/null 2>&1 || return 1
+    local mac; mac=$(/sbin/ifconfig "$HOST_IF" | awk '/ether/{print toupper($2)}')
+    [[ "$mac" == "$TETHER" ]]
+}
+
+default_interface() { /sbin/route -n get default 2>/dev/null | awk '/interface/{print $2}'; }
+
+wifi_back_if_ours() {
+    [[ -f "$WIFI_MARK" ]] || return 0
+    rm -f "$WIFI_MARK"
+    [[ -n "$WIFI_IF" ]] && /usr/sbin/networksetup -setairportpower "$WIFI_IF" on >/dev/null 2>&1
+    say "Wi-Fi switched back on"
+}
+
+# Menu-bar indicator: visible exactly while tethering is on.
+show_bar() {
+    [[ -x "$BAR" ]] || return 0
+    local pid=""
+    [[ -f "$BAR_PID" ]] && pid=$(<"$BAR_PID")
+    [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null && return 0
+    nohup "$BAR" "$SELF" </dev/null >/dev/null 2>&1 &
+    print -r -- $! >"$BAR_PID"
+    disown 2>/dev/null || true
+}
+hide_bar() {
+    local pid=""
+    [[ -f "$BAR_PID" ]] && pid=$(<"$BAR_PID")
+    [[ "$pid" == <-> && "$(ps -o comm= -p "$pid" 2>/dev/null)" == *tetherbar ]] && kill "$pid" 2>/dev/null
+    rm -f "$BAR_PID"
+}
+
+# Remembers the sound output and the Bluetooth devices connected right now (not the phone).
+save_connected() {
+    [[ -x "$AUDIO" ]] && "$AUDIO" get >"$OUTPUT_FILE" 2>/dev/null
+    /usr/sbin/system_profiler SPBluetoothDataType 2>/dev/null |
+        awk '/^      Connected:/{c=1;next} /^      Not Connected:/{c=0} c && /Address:/{print $2}' |
+        grep -v -F "$PHONE" >"$CONNECTED_FILE" 2>/dev/null || true
+}
+
+reconnect_saved() {
+    [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] || return 0
+    local address
+    sleep 2
+    while read -r address; do
+        [[ -n "$address" ]] || continue
+        if "$TAP" "${address//:/-}" >/dev/null 2>&1; then
+            say "reconnected $address"
+        else
+            say "could not reconnect $address yet (it reconnects when you use it)"
+        fi
+    done <"$CONNECTED_FILE"
+}
+
+# Puts the sound output back where it was (only if that was a Bluetooth device; macOS falls
+# back to the speakers while it is away). A device can come back "connected" yet not be
+# offered for sound, so this checks, and reconnects it cleanly if needed.
+restore_output() {
+    [[ -s "$OUTPUT_FILE" && -x "$AUDIO" ]] || return 0
+    local name="" transport="" attempt address
+    IFS=$'\t' read -r name transport <"$OUTPUT_FILE"
+    rm -f "$OUTPUT_FILE"
+    [[ "$transport" == "bluetooth" && -n "$name" ]] || return 0
+    for attempt in 1 2 3; do
+        if "$AUDIO" wait-set "$name" 8 >/dev/null 2>&1; then
+            say "sound is back on $name"
+            return 0
+        fi
+        [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] || break
+        say "$name is connected but not offered for sound; reconnecting it cleanly (try $attempt)"
+        while read -r address; do
+            [[ -n "$address" ]] && "$TAP" "${address//:/-}" --close >/dev/null 2>&1
+        done <"$CONNECTED_FILE"
+        sleep 3
+        while read -r address; do
+            [[ -n "$address" ]] && "$TAP" "${address//:/-}" >/dev/null 2>&1
+        done <"$CONNECTED_FILE"
+    done
+    say "could not move the sound back to $name"
+    notify "Could not bring sound back to $name automatically. Reconnect it from the Bluetooth menu."
+}
+
+# Gives the chip back to macOS: the Mac's own address first, then Apple's Bluetooth on.
+restore_normal_bluetooth() {
+    wifi_back_if_ours
+    hide_bar
+    stop_pidfile "$PIDFILE"
+    set_link down || true
+    if [[ "$("$POWER" get 2>/dev/null)" == "1" && "$(controller_address)" == "$FACTORY" ]]; then
+        rm -f "$ACTIVE_MARK"
+        say "normal Bluetooth is on"
+        reconnect_saved
+        restore_output
+        return 0
+    fi
+    : >"$RESTORE_LOG"
+    local restored=0 _
+    for _ in 1 2 3; do
+        if "$ADDRESS_PROBE" --restore-address "$TETHER" "$FACTORY" >>"$RESTORE_LOG" 2>&1; then
+            restored=1; break
+        fi
+        sleep 0.25
+    done
+    if (( restored == 0 )); then
+        "$ADDRESS_PROBE" --read-address >>"$RESTORE_LOG" 2>&1 || true
+        grep -Fq "controllerAddress=$FACTORY" "$RESTORE_LOG" && restored=1
+    fi
+    if (( restored == 0 )); then
+        say "could not confirm the chip is back on this Mac's own address; Bluetooth left off"
+        say "restarting the Mac always fixes this (details: $RESTORE_LOG)"
+        return 1
+    fi
+    "$POWER" set 1 --wait-ms 10000 >>"$RESTORE_LOG" 2>&1 || true
+    if wait_for_factory_address && [[ "$("$POWER" get 2>/dev/null)" == "1" ]]; then
+        rm -f "$ACTIVE_MARK"
+        say "normal Bluetooth is back"
+        reconnect_saved
+        restore_output
+        return 0
+    fi
+    say "Bluetooth did not come back fully (power=$("$POWER" get 2>/dev/null)); switch it on in the menu bar"
+    return 1
+}
+
+preflight() {
+    local tool
+    for tool in "$POWER" "$ADDRESS_PROBE" "$PANHOST"; do
+        [[ -x "$tool" ]] || { say "missing $tool: run ./install.sh again"; return 1; }
+    done
+    if [[ -n "$(host_pid)" ]]; then say "tethering is already on"; return 1; fi
+    if [[ -n "$(probe_pid)" ]]; then say "a self-test is running; try again in a minute"; return 1; fi
+    if ! "$POWER" set 1 --wait-ms 10000 >/dev/null 2>&1 || ! wait_for_factory_address; then
+        say "Apple's Bluetooth is not in its normal state (chip address $(controller_address)); run: bt-tether stop"
+        return 1
+    fi
+}
+
+launch_host() {   # $1 = probe | bridge ; $2 = keep to append to the log
+    [[ "${2:-}" == "keep" ]] || : >"$LOG"
+    if [[ "$1" == "bridge" ]]; then
+        nohup "$PANHOST" --phone "$PHONE" --local-address "$TETHER" --state-db "$DB" \
+            --netif "$TAP_IF" </dev/null >>"$LOG" 2>&1 &
+        print -r -- $! >"$PIDFILE"
+    else
+        nohup "$PANHOST" --phone "$PHONE" --local-address "$TETHER" --state-db "$DB" \
+            </dev/null >>"$LOG" 2>&1 &
+        print -r -- $! >"$PROBE_PIDFILE"
+    fi
+    disown 2>/dev/null || true
+}
+
+wait_for_log() {   # pattern, seconds, pidfile: 0 when the pattern appears
+    local deadline=$(( SECONDS + $2 ))
+    while (( SECONDS < deadline )); do
+        grep -Eq "$1" "$LOG" 2>/dev/null && return 0
+        if [[ -z "$(pid_from "$3")" ]]; then grep -Eq "$1" "$LOG" 2>/dev/null; return; fi
+        sleep 0.3
+    done
+    return 1
+}
+
+explain_failure() {
+    if grep -q "event=bnep_open_failed" "$LOG" 2>/dev/null; then
+        say "the phone refused tethering: switch on Bluetooth tethering on the phone"
+        say "  Samsung: Settings > Connections > Mobile Hotspot and Tethering > Bluetooth tethering"
+        say "  other Android: Settings > Network & internet > Hotspot & tethering > Bluetooth tethering"
+    elif grep -q "event=pairing_confirm" "$LOG" 2>/dev/null &&
+         ! grep -q "event=pairing_complete status=0x00" "$LOG" 2>/dev/null; then
+        say "the phone asked to pair with \"Mac Tether\" and it was not accepted: run again and tap Pair on the phone"
+    elif grep -q -E "event=authentication status=0x(05|06)" "$LOG" 2>/dev/null; then
+        say "the phone rejected the pairing: on the phone, remove \"Mac Tether\" from Bluetooth devices, then run again"
+    elif grep -q "event=stack_ready" "$LOG" 2>/dev/null; then
+        if grep -q "event=acl_connection status=0x00" "$LOG" 2>/dev/null; then
+            say "the phone connected but tethering did not open: unlock the phone and check Bluetooth tethering is on"
+        else
+            say "could not reach the phone: keep it nearby, unlocked, with Bluetooth on"
+        fi
+    else
+        say "this Mac's Bluetooth chip could not be opened (details: $LOG); run: bt-tether doctor"
+    fi
+}
+
+# ---- commands -----------------------------------------------------------------------------
+
+cmd_test() {
+    need_config
+    preflight || return 1
+    say "self-test: Bluetooth devices on this Mac pause for about a minute, then come back"
+    say "keep the phone unlocked nearby; if it asks to pair with \"Mac Tether\", tap Pair"
+    save_connected
+    : >"$ACTIVE_MARK"
+    if ! "$POWER" set 0 --wait-ms 10000 >/dev/null 2>&1; then
+        rm -f "$ACTIVE_MARK"; say "could not pause Apple's Bluetooth"; return 1
+    fi
+    launch_host probe
+    local ok=1
+    if wait_for_log "event=probe_result" 100 "$PROBE_PIDFILE"; then
+        grep -q "event=probe_result ok=true" "$LOG" && ok=0
+    fi
+    stop_pidfile "$PROBE_PIDFILE"
+    restore_normal_bluetooth || ok=1
+    if (( ok == 0 )); then
+        say "SELF-TEST PASSED: the phone gave this Mac an address over Bluetooth ($(grep -o 'event=probe_dhcp_offer ip=[0-9.]*' "$LOG" | tail -1 | cut -d= -f3))"
+    else
+        say "SELF-TEST FAILED"
+        explain_failure
+    fi
+    return $ok
+}
+
+cmd_start() {
+    need_config
+    preflight || return 1
+    if ! net_ready; then
+        say "the network port is missing: run ./install.sh again, or restart the Mac"
+        return 1
+    fi
+    say "pausing Apple's Bluetooth; Bluetooth devices come back when tethering ends"
+    save_connected
+    : >"$ACTIVE_MARK"
+    if ! "$POWER" set 0 --wait-ms 10000 >/dev/null 2>&1; then
+        rm -f "$ACTIVE_MARK"; say "could not pause Apple's Bluetooth"; return 1
+    fi
+    launch_host bridge
+    if ! wait_for_log "event=bnep_open " "${BT_TETHER_OPEN_WAIT:-100}" "$PIDFILE"; then
+        say "the tethering channel did not open"
+        explain_failure
+        restore_normal_bluetooth
+        return 1
+    fi
+    nohup "$SELF" _watch "$(host_pid)" </dev/null >>"$STATE/watch.log" 2>&1 &
+    print -r -- $! >"$WATCH_PID"
+    disown 2>/dev/null || true
+    set_link up || say "the address helper is missing: run ./install.sh again"
+    local _ ip="" router="" live=0
+    for _ in {1..90}; do
+        ip=$(/sbin/ifconfig "$HOST_IF" | awk '/inet /{print $2; exit}')
+        if [[ -n "$ip" && "$ip" != 169.254.* ]]; then
+            router=$(/usr/sbin/ipconfig getoption "$HOST_IF" router 2>/dev/null)
+            if [[ -n "$router" ]] && /sbin/ping -c 1 -t 1 -b "$HOST_IF" "$router" >/dev/null 2>&1; then
+                live=1; break
+            fi
+        fi
+        sleep 0.7
+    done
+    if (( live == 1 )); then
+        say "TETHERING IS ON: $HOST_IF has $ip and the phone answers at $router"
+        show_bar
+    else
+        say "the channel is open but the phone is not answering on $HOST_IF yet (address: ${ip:-none})"
+    fi
+}
+
+# Supervisor. Tethering ends only when it is ended on purpose:
+#  - stopped by bt-tether: nothing to do;
+#  - the chip was reset under the tether (exit status 9, which is what switching Apple's
+#    Bluetooth on during tethering causes): pause Apple's Bluetooth again and restart;
+#  - anything else, or too many resets in a row: give Bluetooth back to macOS and say so.
+cmd_watch() {
+    need_config
+    local pid="$1" resets=0 window=$SECONDS lines _
+    print -r -- "$(date '+%F %T') supervisor started for host pid $pid"
+    while true; do
+        while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+        if [[ ! -f "$PIDFILE" || "$(<"$PIDFILE")" != "$pid" ]]; then
+            print -r -- "$(date '+%F %T') host $pid was stopped normally"
+            return 0
+        fi
+        if tail -4 "$LOG" 2>/dev/null | grep -q "event=exit status=9"; then
+            (( SECONDS - window > 180 )) && { resets=0; window=$SECONDS; }
+            (( resets += 1 ))
+            if (( resets <= 4 )); then
+                print -r -- "$(date '+%F %T') chip was reset under the tether (reset $resets); taking the radio back"
+                (( resets == 1 )) && notify "Tethering is using the Bluetooth radio and has taken it back. To use other Bluetooth devices, turn tethering off first."
+                sleep 2
+                "$POWER" set 0 --wait-ms 15000 >/dev/null 2>&1
+                lines=$(wc -l <"$LOG" | tr -d ' ')
+                launch_host bridge keep
+                pid=$(host_pid)
+                if [[ -n "$pid" ]]; then
+                    for _ in {1..60}; do
+                        tail -n +$(( lines + 1 )) "$LOG" | grep -q "event=bnep_open " && break
+                        kill -0 "$pid" 2>/dev/null || break
+                        sleep 1
+                    done
+                    print -r -- "$(date '+%F %T') restarted tether (host pid $pid)"
+                    continue
+                fi
+            fi
+            print -r -- "$(date '+%F %T') could not keep the radio; giving Bluetooth back to macOS"
+        else
+            print -r -- "$(date '+%F %T') host $pid ended on its own; restoring normal Bluetooth"
+        fi
+        restore_normal_bluetooth
+        notify "Tethering has ended and normal Bluetooth is back."
+        return 0
+    done
+}
+
+cmd_stop() {
+    need_config
+    local watcher=""
+    [[ -f "$WATCH_PID" ]] && watcher=$(<"$WATCH_PID")
+    if [[ "$watcher" == <-> && "$(ps -o command= -p "$watcher" 2>/dev/null)" == *"bt-tether _watch "* ]]; then
+        kill "$watcher" 2>/dev/null
+    fi
+    rm -f "$WATCH_PID"
+    restore_normal_bluetooth
+}
+
+cmd_only() {
+    need_config
+    if [[ -z "$(host_pid)" ]]; then cmd_start || return 1; fi
+    local router; router=$(/usr/sbin/ipconfig getoption "$HOST_IF" router 2>/dev/null)
+    if [[ -z "$router" ]] || ! /sbin/ping -c 2 -t 3 -b "$HOST_IF" "$router" >/dev/null 2>&1; then
+        say "the tether is not answering, so Wi-Fi stays on"
+        return 1
+    fi
+    [[ -n "$WIFI_IF" ]] || { say "no Wi-Fi port known; tethering is on and Wi-Fi is left as it is"; return 0; }
+    : >"$WIFI_MARK"
+    /usr/sbin/networksetup -setairportpower "$WIFI_IF" off
+    say "BLUETOOTH-ONLY MODE: Wi-Fi is off and the Mac is online through the phone"
+    say "to go back: bt-tether wifi"
+}
+
+cmd_wifi() {
+    need_config
+    rm -f "$WIFI_MARK"
+    [[ -n "$WIFI_IF" ]] && /usr/sbin/networksetup -setairportpower "$WIFI_IF" on >/dev/null 2>&1
+    local _
+    for _ in {1..40}; do
+        [[ -n "$(default_interface)" && "$(default_interface)" != "$HOST_IF" ]] && break
+        sleep 1
+    done
+    if [[ -z "$(default_interface)" || "$(default_interface)" == "$HOST_IF" ]]; then
+        say "Wi-Fi is on but has not joined a network yet; tethering stays on until it does"
+        notify "Wi-Fi is on but has not joined a network, so tethering stays on. It switches by itself once Wi-Fi connects."
+        return 1
+    fi
+    say "Wi-Fi is carrying traffic again"
+    cmd_stop
+}
+
+cmd_status() {
+    if [[ ! -f "$CONFIG" ]]; then say "not set up yet: run ./install.sh in the downloaded folder"; return 1; fi
+    local pid; pid=$(host_pid)
+    if [[ -n "$pid" ]]; then say "tethering: ON"; else say "tethering: off"; fi
+    say "phone: ${PHONE_NAME:-?} ($PHONE)"
+    [[ -f "$WIFI_MARK" ]] && say "Bluetooth-only mode: Wi-Fi was switched off by bt-tether"
+    if [[ -n "$(auto_running)" && ! -f "$AUTO_DISABLED" ]]; then say "automatic mode: ON"; else say "automatic mode: off"; fi
+    if [[ -f "$AGENT_PLIST" ]]; then say "starts at login: yes"; else say "starts at login: no"; fi
+    if [[ -n "$pid" ]]; then
+        say "Bluetooth: lent to tethering (other Bluetooth devices return when it ends)"
+    else
+        say "Bluetooth: $([[ "$("$POWER" get 2>/dev/null)" == 1 ]] && print on || print off)"
+    fi
+    say "internet via: $(default_interface | sed "s/^$HOST_IF\$/the phone over Bluetooth ($HOST_IF)/")"
+}
+
+# ---- automatic mode -----------------------------------------------------------------------
+
+alog() { print -r -- "$(date '+%F %T') $*" >>"$AUTO_LOG"; }
+
+other_network_ok() {   # true when the Mac has a working route that is not the tether
+    [[ -f "$PRETEND_OFFLINE" ]] && return 1
+    local interface; interface=$(default_interface)
+    [[ -n "$interface" && "$interface" != "$HOST_IF" ]]
+}
+
+phone_nearby() {   # asks through Apple's Bluetooth, so other devices are not disturbed
+    [[ -x "$TAP" ]] || return 0
+    "$TAP" "${PHONE//:/-}" >/dev/null 2>&1
+}
+
+auto_running() {
+    local pid=""
+    [[ -f "$AUTO_PID" ]] && pid=$(<"$AUTO_PID")
+    if [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null; then print -r -- "$pid"; fi
+}
+
+cmd_auto_loop() {
+    if [[ ! -f "$CONFIG" ]]; then alog "not configured yet; waiting"; sleep 60; exit 1; fi
+    need_config
+    local other=""
+    [[ -f "$AUTO_PID" ]] && other=$(<"$AUTO_PID")
+    if [[ "$other" == <-> && "$other" != "$$" ]] && kill -0 "$other" 2>/dev/null; then
+        alog "another automatic loop (pid $other) is running; standing by"
+        while kill -0 "$other" 2>/dev/null; do sleep 5; done
+    fi
+    print -r -- $$ >"$AUTO_PID"
+    alog "automatic mode started (pid $$)"
+    # Left over from a logout, restart or crash during tethering: give Bluetooth back first.
+    if [[ -f "$ACTIVE_MARK" && -z "$(host_pid)" && -z "$(probe_pid)" ]]; then
+        alog "tethering was interrupted earlier; restoring normal Bluetooth"
+        restore_normal_bluetooth >>"$AUTO_LOG" 2>&1
+    fi
+    # Ask for Bluetooth access now, not at the first moment it is needed.
+    local asked=0
+    while (( asked < 24 )); do
+        if "$TAP" "${PHONE//:/-}" --status 2>/dev/null | grep -q "paired=1"; then
+            alog "Bluetooth access confirmed"
+            break
+        fi
+        (( asked += 1 ))
+        sleep 5
+    done
+    (( asked >= 24 )) && alog "Bluetooth access not confirmed (allow Bluetooth Tether in System Settings > Privacy & Security > Bluetooth)"
+    local offline_since=0 next_try=0 backoff=0 good=0 dead_since=0 told_refused=0 nearby_wait=15 router
+    while true; do
+        sleep 3
+        [[ -f "$AUTO_DISABLED" ]] && continue
+        [[ -n "$(probe_pid)" ]] && continue
+        if [[ -n "$(host_pid)" ]]; then
+            if other_network_ok; then
+                dead_since=0
+                (( good += 1 ))
+                if (( good >= 2 )); then
+                    alog "another network is back; turning tethering off"
+                    cmd_stop >>"$AUTO_LOG" 2>&1
+                    good=0; offline_since=0; backoff=0; next_try=0; told_refused=0
+                fi
+                continue
+            fi
+            good=0
+            # The tether is the only network: if the phone stops answering for 45 s, give the
+            # radio back so headphones and other devices are not left silent.
+            router=$(/usr/sbin/ipconfig getoption "$HOST_IF" router 2>/dev/null)
+            if [[ -n "$router" ]] && /sbin/ping -c 1 -t 2 -b "$HOST_IF" "$router" >/dev/null 2>&1; then
+                dead_since=0
+            else
+                (( dead_since == 0 )) && dead_since=$SECONDS
+                if (( SECONDS - dead_since >= 45 )); then
+                    alog "the phone has not answered for 45 s; ending tethering so Bluetooth devices return"
+                    cmd_stop >>"$AUTO_LOG" 2>&1
+                    notify "Lost the phone, so tethering ended and your Bluetooth devices are back. It resumes by itself when the phone is nearby again."
+                    dead_since=0; offline_since=$SECONDS; next_try=$(( SECONDS + 20 )); nearby_wait=15
+                fi
+            fi
+            continue
+        fi
+        good=0; dead_since=0
+        if other_network_ok; then offline_since=0; backoff=0; next_try=0; told_refused=0; nearby_wait=15; continue; fi
+        (( offline_since == 0 )) && offline_since=$SECONDS
+        (( SECONDS - offline_since < 8 )) && continue
+        (( SECONDS < next_try )) && continue
+        if ! phone_nearby; then
+            next_try=$(( SECONDS + nearby_wait ))
+            (( nearby_wait = nearby_wait * 2 > 60 ? 60 : nearby_wait * 2 ))
+            continue
+        fi
+        nearby_wait=15
+        alog "no network and the phone is nearby; turning tethering on"
+        if BT_TETHER_OPEN_WAIT=30 cmd_start >>"$AUTO_LOG" 2>&1; then
+            notify "No other network, so the Mac is online through your phone over Bluetooth. Other Bluetooth devices return when Wi-Fi is back."
+            backoff=0; told_refused=0
+        else
+            if (( told_refused == 0 )) && grep -q "event=bnep_open_failed" "$LOG" 2>/dev/null; then
+                told_refused=1
+                notify "Your phone did not accept Bluetooth tethering. Switch on Bluetooth tethering in the phone's hotspot settings."
+            fi
+            if (( backoff == 0 )); then backoff=30; else (( backoff = backoff * 2 > 600 ? 600 : backoff * 2 )); fi
+            next_try=$(( SECONDS + backoff ))
+            alog "could not start tethering; next try in ${backoff}s"
+        fi
+    done
+}
+
+cmd_auto() {
+    local pid
+    case "${1:-}" in
+        on)
+            rm -f "$AUTO_DISABLED"
+            if [[ -z "$(auto_running)" ]]; then
+                if [[ -f "$AGENT_PLIST" ]]; then
+                    /bin/launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 ||
+                        /bin/launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1
+                else
+                    nohup "$SELF" _auto </dev/null >>"$AUTO_LOG" 2>&1 &
+                    disown 2>/dev/null || true
+                fi
+                sleep 2
+            fi
+            if [[ -n "$(auto_running)" ]]; then say "automatic mode ON"
+            else say "automatic mode did not start; see $AUTO_LOG"; return 1; fi
+            ;;
+        off)
+            if [[ -f "$AGENT_PLIST" ]]; then
+                : >"$AUTO_DISABLED"          # the login item keeps running, idle
+            else
+                pid=$(auto_running)
+                [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+                rm -f "$AUTO_PID"
+            fi
+            say "automatic mode off (tethering itself is left as it is)"
+            ;;
+        *) say "usage: bt-tether auto on|off"; return 2 ;;
+    esac
+}
+
+# ---- checks and pairing -------------------------------------------------------------------
+
+paired_phones() {   # "address<TAB>name" for every paired device whose type is a phone
+    /usr/sbin/system_profiler SPBluetoothDataType 2>/dev/null | awk '
+        /^          [^ ].*:$/ { name = $0; sub(/^ +/, "", name); sub(/:$/, "", name); addr = ""; next }
+        /^              Address:/ { addr = $2 }
+        /^              Minor Type:/ {
+            kind = $0; sub(/^ *Minor Type: */, "", kind)
+            if (kind ~ /Phone|Cellular|Smartphone/ && addr != "") print addr "\t" name
+        }'
+}
+
+cmd_doctor() {
+    local fails=0 version major chipset transport state address first phones out
+    ok()   { print -r -- "  ok    $*"; }
+    bad()  { print -r -- "  FAIL  $*"; (( fails += 1 )); }
+    note() { print -r -- "  note  $*"; }
+    print "Checking this Mac (nothing is changed):"
+    if [[ "$(uname -m)" == arm64 ]]; then ok "Apple silicon Mac"
+    else bad "not an Apple silicon Mac (Intel Macs are not supported)"; fi
+    version=$(sw_vers -productVersion); major=${version%%.*}
+    if (( major >= 26 )); then ok "macOS $version"
+    elif (( major >= 13 )); then note "macOS $version: tested on macOS 26 only; it may still work"
+    else bad "macOS $version is too old (needs 13 or later)"; fi
+    chipset=$(controller_field Chipset); transport=$(controller_field Transport)
+    state=$(controller_field State); address=$(controller_address)
+    if [[ "$transport" == PCIe && "$chipset" == BCM_* ]]; then ok "Bluetooth chip $chipset on PCIe"
+    else bad "Bluetooth chip ${chipset:-unknown} on ${transport:-unknown}: only Broadcom chips on PCIe are supported"; fi
+    if ioreg -r -c AppleConvergedIPCInterface -l 2>/dev/null | grep -q '"ACIPCInterfaceProtocol" = "hci"' &&
+       ioreg -r -c AppleConvergedIPCInterface -l 2>/dev/null | grep -q '"ACIPCInterfaceProtocol" = "acl"'; then
+        ok "direct access to the Bluetooth chip is available"
+    else
+        bad "this Mac does not expose its Bluetooth chip the way this tool needs"
+    fi
+    if [[ -n "$(host_pid)" ]]; then
+        note "tethering is on right now, so the Bluetooth checks below are skipped"
+    else
+        if [[ "$state" == On ]]; then ok "Bluetooth is on"; else bad "Bluetooth is off: switch it on in the menu bar"; fi
+        if [[ "$address" == ??:??:??:??:??:?? ]]; then
+            first=$(( 16#${address[1,2]} ))
+            if (( first & 2 )); then bad "the chip is not on this Mac's own address ($address): restart the Mac"
+            else ok "this Mac's Bluetooth address is readable"; fi
+        else
+            bad "could not read this Mac's Bluetooth address"
+        fi
+    fi
+    if [[ -n "$(networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}')" ]]; then
+        ok "Wi-Fi port found"
+    else
+        note "no Wi-Fi port found; switching back to Wi-Fi will not apply"
+    fi
+    phones=$(paired_phones)
+    if [[ -n "$phones" ]]; then
+        ok "phone(s) paired with this Mac: $(print -r -- "$phones" | awk -F'\t' '{printf "%s%s", (NR > 1 ? ", " : ""), $2}')"
+    else
+        bad "no phone is paired with this Mac: pair it in System Settings > Bluetooth, then run this again"
+    fi
+    if [[ -n "$PHONE" && -x "$TAP" && -z "$(host_pid)" ]]; then
+        out=$("$TAP" "${PHONE//:/-}" --nap 2>&1)
+        case "$out" in
+            *nap=1*) ok "${PHONE_NAME:-the phone} answers over Bluetooth and offers Bluetooth tethering" ;;
+            *nap=0*) bad "${PHONE_NAME:-the phone} answers but does not offer Bluetooth tethering" ;;
+            *) bad "${PHONE_NAME:-the phone} did not answer over Bluetooth: keep it nearby and unlocked; if this repeats, run: bt-tether repair-pairing" ;;
+        esac
+    fi
+    if [[ -f "$HERE/scripts/build.sh" ]]; then
+        if xcode-select -p >/dev/null 2>&1 && command -v clang >/dev/null && command -v git >/dev/null; then
+            ok "Apple's command line tools are installed"
+        else
+            bad "Apple's command line tools are missing: run  xcode-select --install  and try again"
+        fi
+    fi
+    if (( fails == 0 )); then print "All checks passed."; else print "$fails problem(s) to fix first."; fi
+    (( fails == 0 ))
+}
+
+cmd_repair_pairing() {
+    need_config
+    [[ -n "$(host_pid)" ]] && { say "switch tethering off first: bt-tether stop"; return 1; }
+    say "removing and redoing this Mac's own pairing with ${PHONE_NAME:-the phone}"
+    say "keep the phone unlocked; when it asks to pair with this Mac, tap Pair"
+    "$PAIR" "${PHONE//:/-}" 2>&1 | grep -E "RESULT|CONFIRM" | sed 's/^\[[0-9:.]*\] /  /'
+    if "$TAP" "${PHONE//:/-}" >/dev/null 2>&1; then say "pairing repaired: the phone answers"
+    else say "the phone still does not answer: remove this Mac from the phone's Bluetooth list, then pair again in System Settings > Bluetooth"; return 1; fi
+}
+
+# ---- installation (called by install.sh) --------------------------------------------------
+
+# The login item cannot read ~/Downloads, so everything runs from a copy in the Library folder.
+cmd_update_app() {
+    [[ "$HERE" == "$APP_DIR" ]] && return 0
+    local stage="$APP_DIR.new" item
+    rm -rf "$stage"; mkdir -p "$stage/build"
+    cp -p "$HERE/bt-tether" "$HERE/net-root.sh" "$stage/" || return 1
+    for item in panhost tap pair audioroute tetherbar BluetoothTether BluetoothPowerControl SkywalkHCIAddressProbe; do
+        [[ -x "$BIN/$item" ]] || { say "missing $BIN/$item: run ./install.sh"; rm -rf "$stage"; return 1; }
+        cp -p "$BIN/$item" "$stage/build/$item"
+    done
+    rm -rf "$APP_DIR.old"
+    [[ -d "$APP_DIR" ]] && mv "$APP_DIR" "$APP_DIR.old"
+    mv "$stage" "$APP_DIR" && rm -rf "$APP_DIR.old"
+    say "copied to $APP_DIR"
+}
+
+daemon_plist() {   # label, action, extra keys
+    cat <<PLIST_END
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>$1</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string><string>$ROOT_DIR/net-root.sh</string>
+        <string>$2</string><string>$USER</string><string>$TETHER</string>
+        <string>$HOST_IF</string><string>$TAP_IF</string>
+    </array>
+    $3
+</dict></plist>
+PLIST_END
+}
+
+# The one step that needs the administrator password: a root-owned copy of net-root.sh and
+# two LaunchDaemons that only ever run it (port at startup; address on and off), plus the
+# bt-tether command in /usr/local/bin. No passwordless-admin rule is created.
+cmd_install_root() {
+    need_config
+    [[ -n "$(host_pid)" ]] && { say "switch tethering off first: bt-tether stop"; return 1; }
+    [[ -x "$APP_DIR/bt-tether" ]] || { say "the installed copy is missing; run ./install.sh"; return 1; }
+    local stage="$STATE/stage"
+    rm -rf "$stage"; mkdir -p "$stage"
+    cp "$APP_DIR/net-root.sh" "$APP_DIR/build/BluetoothPowerControl" "$stage/"
+    daemon_plist "$BOOT_LABEL" boot "<key>RunAtLoad</key><true/>" >"$stage/boot.plist"
+    daemon_plist "$LINK_LABEL" sync "<key>WatchPaths</key><array><string>$LINK_STATE</string></array><key>ThrottleInterval</key><integer>1</integer>" >"$stage/link.plist"
+    cat >"$stage/install.sh" <<SCRIPT_END
+#!/bin/zsh
+set -eu
+/bin/mkdir -p '$ROOT_DIR'
+/usr/bin/install -o root -g wheel -m 755 '$stage/net-root.sh' '$ROOT_DIR/net-root.sh'
+/usr/bin/install -o root -g wheel -m 755 '$stage/BluetoothPowerControl' '$ROOT_DIR/BluetoothPowerControl'
+print -r -- down >'$LINK_STATE'
+/usr/sbin/chown '$USER' '$LINK_STATE'
+/bin/chmod 644 '$LINK_STATE'
+/usr/bin/install -o root -g wheel -m 644 '$stage/boot.plist' '/Library/LaunchDaemons/$BOOT_LABEL.plist'
+/usr/bin/install -o root -g wheel -m 644 '$stage/link.plist' '/Library/LaunchDaemons/$LINK_LABEL.plist'
+/bin/launchctl bootout system/$BOOT_LABEL 2>/dev/null || true
+/bin/launchctl bootout system/$LINK_LABEL 2>/dev/null || true
+/bin/launchctl bootstrap system '/Library/LaunchDaemons/$BOOT_LABEL.plist'
+/bin/launchctl bootstrap system '/Library/LaunchDaemons/$LINK_LABEL.plist'
+/bin/mkdir -p '${CLI_LINK:h}'
+/bin/ln -sfn '$APP_DIR/bt-tether' '$CLI_LINK'
+SCRIPT_END
+    say "macOS now asks for your password once, to install the network helper"
+    if ! /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/install.sh'\" with administrator privileges" >/dev/null; then
+        rm -rf "$stage"
+        say "the network helper was not installed (password dialog cancelled or failed)"
+        return 1
+    fi
+    rm -rf "$stage"
+    local _
+    for _ in {1..20}; do net_ready && break; sleep 0.5; done
+    if net_ready && [[ -w "$LINK_STATE" ]]; then
+        say "network helper installed: port $HOST_IF ready, and it is recreated at every startup"
+    else
+        say "the network helper is installed but the port $HOST_IF is not ready"
+        return 1
+    fi
+}
+
+cmd_install_login() {
+    need_config
+    [[ -x "$APP_DIR/build/BluetoothTether" ]] || { say "the installed copy is missing; run ./install.sh"; return 1; }
+    /bin/launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+    rm -rf "$APP_BUNDLE"
+    mkdir -p "$APP_BUNDLE/Contents/MacOS"
+    cp -p "$APP_DIR/build/BluetoothTether" "$APP_BUNDLE/Contents/MacOS/BluetoothTether"
+    cat >"$APP_BUNDLE/Contents/Info.plist" <<PLIST_END
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+    <key>CFBundleName</key><string>Bluetooth Tether</string>
+    <key>CFBundleDisplayName</key><string>Bluetooth Tether</string>
+    <key>CFBundleExecutable</key><string>BluetoothTether</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Bluetooth Tether checks whether your phone is nearby before switching to Bluetooth tethering, and reconnects your Bluetooth devices afterwards.</string>
+</dict></plist>
+PLIST_END
+    /usr/bin/codesign --force --sign - --timestamp=none "$APP_BUNDLE" >/dev/null 2>&1 ||
+        { say "could not sign the login item"; return 1; }
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat >"$AGENT_PLIST" <<PLIST_END
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>$AGENT_LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>$APP_BUNDLE/Contents/MacOS/BluetoothTether</string></array>
+    <key>AssociatedBundleIdentifiers</key><array><string>$BUNDLE_ID</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>$STATE/agent.log</string>
+    <key>StandardErrorPath</key><string>$STATE/agent.log</string>
+</dict></plist>
+PLIST_END
+    local pid; pid=$(auto_running)
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    rm -f "$AUTO_PID" "$AUTO_DISABLED"
+    sleep 1
+    /bin/launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" || { say "macOS did not accept the login item"; return 1; }
+    # A bt-tether link made by hand in Homebrew's folder is pointed at the installed copy too.
+    if [[ -L /opt/homebrew/bin/bt-tether && "$(readlink /opt/homebrew/bin/bt-tether)" == *bt-tether* ]]; then
+        ln -sfn "$APP_DIR/bt-tether" /opt/homebrew/bin/bt-tether
+    fi
+    say "login item installed; if macOS asks whether Bluetooth Tether may use Bluetooth, choose Allow"
+    local n=0
+    while (( n < 40 )); do
+        grep -q "Bluetooth access confirmed" "$AUTO_LOG" 2>/dev/null &&
+            [[ "$(grep -n 'automatic mode started' "$AUTO_LOG" | tail -1 | cut -d: -f1)" -lt "$(grep -n 'Bluetooth access confirmed' "$AUTO_LOG" | tail -1 | cut -d: -f1)" ]] && break
+        (( n += 1 )); sleep 3
+    done
+    if [[ -n "$(auto_running)" ]] && (( n < 40 )); then
+        say "Bluetooth Tether is running and has Bluetooth access"
+    elif [[ -n "$(auto_running)" ]]; then
+        say "Bluetooth Tether is running but Bluetooth access is not confirmed yet:"
+        say "  System Settings > Privacy & Security > Bluetooth > switch on Bluetooth Tether"
+    else
+        say "the login item did not start; details: $STATE/agent.log"
+        return 1
+    fi
+}
+
+cmd_uninstall() {
+    local keep=0
+    [[ "${1:-}" == "--keep-pairing" ]] && keep=1
+    if [[ -f "$CONFIG" && -n "$(host_pid)" ]]; then cmd_stop; fi
+    /bin/launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+    rm -f "$AGENT_PLIST"
+    local pid; pid=$(auto_running); [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    if [[ -e "/Library/LaunchDaemons/$BOOT_LABEL.plist" || -e "/Library/LaunchDaemons/$LINK_LABEL.plist" ||
+          -d "$ROOT_DIR" || -L "$CLI_LINK" ]]; then
+        local stage="$HOME/Library/Caches/bt-tether-uninstall"
+        rm -rf "$stage"; mkdir -p "$stage"
+        cat >"$stage/uninstall.sh" <<SCRIPT_END
+#!/bin/zsh
+/bin/launchctl bootout system/$BOOT_LABEL 2>/dev/null || true
+/bin/launchctl bootout system/$LINK_LABEL 2>/dev/null || true
+[[ -f '$ROOT_DIR/net-root.sh' ]] && /bin/zsh '$ROOT_DIR/net-root.sh' down '$USER' '${TETHER:-00:00:00:00:00:00}' '${HOST_IF:-feth0}' '${TAP_IF:-feth1}'
+/bin/rm -f '/Library/LaunchDaemons/$BOOT_LABEL.plist' '/Library/LaunchDaemons/$LINK_LABEL.plist'
+/bin/rm -rf '$ROOT_DIR'
+[[ -L '$CLI_LINK' ]] && /bin/rm -f '$CLI_LINK'
+exit 0
+SCRIPT_END
+        say "macOS now asks for your password once, to remove the network helper"
+        /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/uninstall.sh'\" with administrator privileges" >/dev/null ||
+            say "the network helper was not removed (password dialog cancelled); run uninstall again"
+        rm -rf "$stage"
+    fi
+    if [[ -L /opt/homebrew/bin/bt-tether && "$(readlink /opt/homebrew/bin/bt-tether)" == *bt-tether* ]]; then
+        rm -f /opt/homebrew/bin/bt-tether
+    fi
+    rm -rf "$APP_BUNDLE" "$APP_DIR"
+    if (( keep == 1 )); then
+        find "$STATE" -mindepth 1 -maxdepth 1 ! -name state.tlv ! -name config -exec rm -rf {} +
+        say "removed; the tether's pairing key and settings are kept in $STATE"
+    else
+        rm -rf "$STATE"
+        say "removed everything; on the phone, also remove \"Mac Tether\" from its Bluetooth devices"
+    fi
+}
+
+case "${1:-status}" in
+    status)          cmd_status ;;
+    start)           cmd_start ;;
+    stop)            cmd_stop ;;
+    only)            cmd_only ;;
+    wifi)            cmd_wifi ;;
+    auto)            cmd_auto "${2:-}" ;;
+    test)            cmd_test ;;
+    doctor)          cmd_doctor ;;
+    repair-pairing)  cmd_repair_pairing ;;
+    uninstall)       cmd_uninstall "${2:-}" ;;
+    help|-h|--help)  usage ;;
+    _auto)           cmd_auto_loop ;;
+    _watch)          cmd_watch "$2" ;;
+    _phones)         paired_phones ;;
+    _update-app)     cmd_update_app ;;
+    _install-root)   cmd_install_root ;;
+    _install-login)  cmd_install_login ;;
+    *) usage; exit 2 ;;
+esac
