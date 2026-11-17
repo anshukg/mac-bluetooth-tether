@@ -163,58 +163,112 @@ hide_bar() {
     rm -f "$BAR_PID"
 }
 
-# Remembers the sound output and the Bluetooth devices connected right now (not the phone).
-save_connected() {
-    [[ -x "$AUDIO" ]] && "$AUDIO" get >"$OUTPUT_FILE" 2>/dev/null
-    /usr/sbin/system_profiler SPBluetoothDataType 2>/dev/null |
-        awk '/^      Connected:/{c=1;next} /^      Not Connected:/{c=0} c && /Address:/{print $2}' |
-        grep -v -F "$PHONE" >"$CONNECTED_FILE" 2>/dev/null || true
+# One change of the radio at a time, across every bt-tether process (automatic loop,
+# supervisor, commands). Re-entrant within a process.
+LOCK="$STATE/radio.lock"
+LOCK_DEPTH=0
+take_lock() {   # $1 = seconds to wait (default 300)
+    if (( LOCK_DEPTH > 0 )); then (( LOCK_DEPTH += 1 )); return 0; fi
+    local deadline=$(( SECONDS + ${1:-300} )) holder empty=0
+    while (( SECONDS < deadline )); do
+        if mkdir "$LOCK" 2>/dev/null; then
+            print -r -- $$ >"$LOCK/pid"; LOCK_DEPTH=1; return 0
+        fi
+        holder=$(cat "$LOCK/pid" 2>/dev/null)
+        if [[ -z "$holder" ]]; then
+            (( empty += 1 )); (( empty > 20 )) && rm -rf "$LOCK"
+        elif ! kill -0 "$holder" 2>/dev/null; then
+            rm -rf "$LOCK"                       # left by a process that is gone
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+drop_lock() {
+    (( LOCK_DEPTH > 0 )) || return 0
+    (( LOCK_DEPTH -= 1 ))
+    (( LOCK_DEPTH == 0 )) && [[ "$(cat "$LOCK/pid" 2>/dev/null)" == "$$" ]] && rm -rf "$LOCK"
+    return 0
+}
+radio_busy() {   # true while another process is changing the radio
+    local holder; holder=$(cat "$LOCK/pid" 2>/dev/null)
+    [[ -d "$LOCK" && "$holder" != "$$" ]] && { [[ -z "$holder" ]] || kill -0 "$holder" 2>/dev/null; }
 }
 
-reconnect_saved() {
-    [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] || return 0
-    local address
-    sleep 2
-    while read -r address; do
+# Remembers what to bring back when tethering ends: the Bluetooth devices connected now (not
+# the phone) and the sound output. Anything not yet brought back from an earlier session is
+# kept, so a quick restart of tethering never loses it. Lines are "address<TAB>time saved".
+save_connected() {
+    local now current="" address
+    now=$(date +%s)
+    [[ -x "$AUDIO" ]] && current=$("$AUDIO" get 2>/dev/null)
+    if [[ "$current" == *$'\t'bluetooth || ! -s "$OUTPUT_FILE" ]]; then
+        [[ -n "$current" ]] && print -r -- "$current" >"$OUTPUT_FILE"
+    fi
+    local -a lines
+    [[ -s "$CONNECTED_FILE" ]] && lines=("${(@f)$(<"$CONNECTED_FILE")}")
+    for address in $(/usr/sbin/system_profiler SPBluetoothDataType 2>/dev/null |
+            awk '/^      Connected:/{c=1;next} /^      Not Connected:/{c=0} c && /Address:/{print $2}' |
+            grep -v -i -F "$PHONE"); do
+        print -rl -- "${lines[@]}" | grep -q -i "^$address" || lines+=("$address"$'\t'"$now")
+    done
+    print -rl -- "${lines[@]}" | grep -v '^$' >"$CONNECTED_FILE.new"
+    mv -f "$CONNECTED_FILE.new" "$CONNECTED_FILE"
+}
+
+# Brings back the saved devices, then their sound. A device that does not answer stays on the
+# list for the next time, for up to an hour.
+restore_devices() {
+    local -a lines keep back
+    local line address stamp now
+    now=$(date +%s)
+    [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] && lines=("${(@f)$(<"$CONNECTED_FILE")}")
+    (( ${#lines} )) && sleep 2
+    for line in "${lines[@]}"; do
+        address=${line%%$'\t'*}; stamp=${line#*$'\t'}
         [[ -n "$address" ]] || continue
+        [[ "$stamp" == <-> ]] || stamp=$now
         if "$TAP" "${address//:/-}" >/dev/null 2>&1; then
-            say "reconnected $address"
-        else
-            say "could not reconnect $address yet (it reconnects when you use it)"
+            say "reconnected $address"; back+=("$address")
+        elif (( now - stamp < 3600 )); then
+            say "could not reconnect $address yet; it is tried again next time"; keep+=("$line")
         fi
-    done <"$CONNECTED_FILE"
+    done
+    if (( ${#keep} )); then print -rl -- "${keep[@]}" >"$CONNECTED_FILE"; else rm -f "$CONNECTED_FILE"; fi
+    restore_output "${back[@]}"
 }
 
 # Puts the sound output back where it was (only if that was a Bluetooth device; macOS falls
 # back to the speakers while it is away). A device can come back "connected" yet not be
-# offered for sound, so this checks, and reconnects it cleanly if needed.
-restore_output() {
+# offered for sound, so this checks, and reconnects the devices cleanly if needed.
+restore_output() {   # arguments: addresses that were reconnected
     [[ -s "$OUTPUT_FILE" && -x "$AUDIO" ]] || return 0
     local name="" transport="" attempt address
     IFS=$'\t' read -r name transport <"$OUTPUT_FILE"
-    rm -f "$OUTPUT_FILE"
-    [[ "$transport" == "bluetooth" && -n "$name" ]] || return 0
+    if [[ "$transport" != "bluetooth" || -z "$name" ]]; then rm -f "$OUTPUT_FILE"; return 0; fi
     for attempt in 1 2 3; do
         if "$AUDIO" wait-set "$name" 8 >/dev/null 2>&1; then
+            rm -f "$OUTPUT_FILE"
             say "sound is back on $name"
             return 0
         fi
-        [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] || break
+        (( $# )) || break
         say "$name is connected but not offered for sound; reconnecting it cleanly (try $attempt)"
-        while read -r address; do
-            [[ -n "$address" ]] && "$TAP" "${address//:/-}" --close >/dev/null 2>&1
-        done <"$CONNECTED_FILE"
+        for address in "$@"; do "$TAP" "${address//:/-}" --close >/dev/null 2>&1; done
         sleep 3
-        while read -r address; do
-            [[ -n "$address" ]] && "$TAP" "${address//:/-}" >/dev/null 2>&1
-        done <"$CONNECTED_FILE"
+        for address in "$@"; do "$TAP" "${address//:/-}" >/dev/null 2>&1; done
     done
-    say "could not move the sound back to $name"
-    notify "Could not bring sound back to $name automatically. Reconnect it from the Bluetooth menu."
+    if [[ -s "$CONNECTED_FILE" ]]; then
+        say "sound goes back to $name once it reconnects"   # kept for the next attempt
+    else
+        rm -f "$OUTPUT_FILE"
+        say "could not move the sound back to $name"
+        notify "Could not bring sound back to $name automatically. Reconnect it from the Bluetooth menu."
+    fi
 }
 
 # Gives the chip back to macOS: the Mac's own address first, then Apple's Bluetooth on.
-restore_normal_bluetooth() {
+restore_body() {
     wifi_back_if_ours
     hide_bar
     stop_pidfile "$PIDFILE"
@@ -222,8 +276,7 @@ restore_normal_bluetooth() {
     if [[ "$("$POWER" get 2>/dev/null)" == "1" && "$(controller_address)" == "$FACTORY" ]]; then
         rm -f "$ACTIVE_MARK"
         say "normal Bluetooth is on"
-        reconnect_saved
-        restore_output
+        restore_devices
         return 0
     fi
     : >"$RESTORE_LOG"
@@ -247,12 +300,19 @@ restore_normal_bluetooth() {
     if wait_for_factory_address && [[ "$("$POWER" get 2>/dev/null)" == "1" ]]; then
         rm -f "$ACTIVE_MARK"
         say "normal Bluetooth is back"
-        reconnect_saved
-        restore_output
+        restore_devices
         return 0
     fi
     say "Bluetooth did not come back fully (power=$("$POWER" get 2>/dev/null)); switch it on in the menu bar"
     return 1
+}
+
+restore_normal_bluetooth() {
+    take_lock || say "another bt-tether step is taking long; restoring anyway"
+    restore_body
+    local rc=$?
+    drop_lock
+    return $rc
 }
 
 preflight() {
@@ -315,8 +375,7 @@ explain_failure() {
 
 # ---- commands -----------------------------------------------------------------------------
 
-cmd_test() {
-    need_config
+test_body() {
     preflight || return 1
     say "self-test: Bluetooth devices on this Mac pause for about a minute, then come back"
     say "keep the phone unlocked nearby; if it asks to pair with \"Mac Tether\", tap Pair"
@@ -341,8 +400,7 @@ cmd_test() {
     return $ok
 }
 
-cmd_start() {
-    need_config
+start_body() {
     preflight || return 1
     if ! net_ready; then
         say "the network port is missing: run ./install.sh again, or restart the Mac"
@@ -384,6 +442,24 @@ cmd_start() {
     fi
 }
 
+cmd_test() {
+    need_config
+    take_lock 120 || { say "another bt-tether step is still running; try again shortly"; return 1; }
+    test_body
+    local rc=$?
+    drop_lock
+    return $rc
+}
+
+cmd_start() {
+    need_config
+    take_lock 120 || { say "another bt-tether step is still running; try again shortly"; return 1; }
+    start_body
+    local rc=$?
+    drop_lock
+    return $rc
+}
+
 # Supervisor. Tethering ends only when it is ended on purpose:
 #  - stopped by bt-tether: nothing to do;
 #  - the chip was reset under the tether (exit status 9, which is what switching Apple's
@@ -405,10 +481,12 @@ cmd_watch() {
             if (( resets <= 4 )); then
                 print -r -- "$(date '+%F %T') chip was reset under the tether (reset $resets); taking the radio back"
                 (( resets == 1 )) && notify "Tethering is using the Bluetooth radio and has taken it back. To use other Bluetooth devices, turn tethering off first."
+                take_lock 120
                 sleep 2
                 "$POWER" set 0 --wait-ms 15000 >/dev/null 2>&1
                 lines=$(wc -l <"$LOG" | tr -d ' ')
                 launch_host bridge keep
+                drop_lock
                 pid=$(host_pid)
                 if [[ -n "$pid" ]]; then
                     for _ in {1..60}; do
@@ -542,6 +620,7 @@ cmd_auto_loop() {
     while true; do
         sleep 3
         [[ -f "$AUTO_DISABLED" ]] && continue
+        radio_busy && continue
         [[ -n "$(probe_pid)" ]] && continue
         if [[ -n "$(host_pid)" ]]; then
             if other_network_ok; then
@@ -845,19 +924,22 @@ PLIST_END
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     rm -f "$AUTO_PID" "$AUTO_DISABLED"
     sleep 1
+    # Only log lines written from here on count; older runs have left the same messages.
+    local mark; mark=$(wc -l <"$AUTO_LOG" 2>/dev/null | tr -d ' ')
     /bin/launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" || { say "macOS did not accept the login item"; return 1; }
     # A bt-tether link made by hand in Homebrew's folder is pointed at the installed copy too.
     if [[ -L /opt/homebrew/bin/bt-tether && "$(readlink /opt/homebrew/bin/bt-tether)" == *bt-tether* ]]; then
         ln -sfn "$APP_DIR/bt-tether" /opt/homebrew/bin/bt-tether
     fi
     say "login item installed; if macOS asks whether Bluetooth Tether may use Bluetooth, choose Allow"
-    local n=0
-    while (( n < 40 )); do
-        grep -q "Bluetooth access confirmed" "$AUTO_LOG" 2>/dev/null &&
-            [[ "$(grep -n 'automatic mode started' "$AUTO_LOG" | tail -1 | cut -d: -f1)" -lt "$(grep -n 'Bluetooth access confirmed' "$AUTO_LOG" | tail -1 | cut -d: -f1)" ]] && break
+    local n=0 fresh="" confirmed=0
+    while (( n < 45 )); do
+        fresh=$(tail -n +$(( ${mark:-0} + 1 )) "$AUTO_LOG" 2>/dev/null)
+        [[ "$fresh" == *"Bluetooth access confirmed"* ]] && { confirmed=1; break; }
+        [[ "$fresh" == *"Bluetooth access not confirmed"* ]] && break
         (( n += 1 )); sleep 3
     done
-    if [[ -n "$(auto_running)" ]] && (( n < 40 )); then
+    if [[ -n "$(auto_running)" ]] && (( confirmed )); then
         say "Bluetooth Tether is running and has Bluetooth access"
     elif [[ -n "$(auto_running)" ]]; then
         say "Bluetooth Tether is running but Bluetooth access is not confirmed yet:"
