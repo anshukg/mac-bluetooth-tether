@@ -220,7 +220,7 @@ save_connected() {
 # list for the next time, for up to an hour.
 restore_devices() {
     local -a lines keep back
-    local line address stamp now
+    local line address stamp now out name
     now=$(date +%s)
     [[ -s "$CONNECTED_FILE" && -x "$TAP" ]] && lines=("${(@f)$(<"$CONNECTED_FILE")}")
     (( ${#lines} )) && sleep 2
@@ -228,10 +228,13 @@ restore_devices() {
         address=${line%%$'\t'*}; stamp=${line#*$'\t'}
         [[ -n "$address" ]] || continue
         [[ "$stamp" == <-> ]] || stamp=$now
-        if "$TAP" "${address//:/-}" >/dev/null 2>&1; then
-            say "reconnected $address"; back+=("$address")
+        out=$("$TAP" "${address//:/-}" 2>&1); local rc=$?
+        name=$(print -r -- "$out" | sed -n 's/^device=\(.*\) paired=.*/\1/p' | head -1)
+        [[ -n "$name" && "$name" != "?" ]] || name=$address
+        if (( rc == 0 )); then
+            say "reconnected $name"; back+=("$address")
         elif (( now - stamp < 3600 )); then
-            say "could not reconnect $address yet; it is tried again next time"; keep+=("$line")
+            say "$name did not reconnect yet; it is tried again next time"; keep+=("$line")
         fi
     done
     if (( ${#keep} )); then print -rl -- "${keep[@]}" >"$CONNECTED_FILE"; else rm -f "$CONNECTED_FILE"; fi
@@ -377,7 +380,7 @@ explain_failure() {
 
 test_body() {
     preflight || return 1
-    say "self-test: Bluetooth devices on this Mac pause for about a minute, then come back"
+    say "testing: Bluetooth devices on this Mac pause for up to a minute, then come back"
     say "keep the phone unlocked nearby; if it asks to pair with \"Mac Tether\", tap Pair"
     save_connected
     : >"$ACTIVE_MARK"
@@ -392,9 +395,9 @@ test_body() {
     stop_pidfile "$PROBE_PIDFILE"
     restore_normal_bluetooth || ok=1
     if (( ok == 0 )); then
-        say "SELF-TEST PASSED: the phone gave this Mac an address over Bluetooth ($(grep -o 'event=probe_dhcp_offer ip=[0-9.]*' "$LOG" | tail -1 | cut -d= -f3))"
+        say "TEST PASSED: ${PHONE_NAME:-the phone} shared its internet with this Mac over Bluetooth"
     else
-        say "SELF-TEST FAILED"
+        say "TEST DID NOT PASS"
         explain_failure
     fi
     return $ok
@@ -581,6 +584,12 @@ other_network_ok() {   # true when the Mac has a working route that is not the t
 phone_nearby() {   # asks through Apple's Bluetooth, so other devices are not disturbed
     [[ -x "$TAP" ]] || return 0
     "$TAP" "${PHONE//:/-}" >/dev/null 2>&1
+}
+
+# True when the login item is running and macOS has given it Bluetooth access.
+agent_has_access() {
+    [[ -n "$(auto_running)" ]] || return 1
+    awk '/automatic mode started/{s=NR} /Bluetooth access confirmed/{c=NR} END{exit !(s && c > s)}' "$AUTO_LOG" 2>/dev/null
 }
 
 auto_running() {
@@ -861,7 +870,7 @@ print -r -- down >'$LINK_STATE'
 /bin/ln -sfn '$APP_DIR/bt-tether' '$CLI_LINK'
 SCRIPT_END
     say "macOS now asks for your password once, to install the network helper"
-    if ! /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/install.sh'\" with administrator privileges" >/dev/null; then
+    if ! /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/install.sh'\" with prompt \"Bluetooth Tether needs your Mac password to install its network helper.\" with administrator privileges" >/dev/null; then
         rm -rf "$stage"
         say "the network helper was not installed (password dialog cancelled or failed)"
         return 1
@@ -972,7 +981,7 @@ cmd_uninstall() {
 exit 0
 SCRIPT_END
         say "macOS now asks for your password once, to remove the network helper"
-        /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/uninstall.sh'\" with administrator privileges" >/dev/null ||
+        /usr/bin/osascript -e "do shell script \"/bin/zsh '$stage/uninstall.sh'\" with prompt \"Bluetooth Tether needs your Mac password to remove its network helper.\" with administrator privileges" >/dev/null ||
             say "the network helper was not removed (password dialog cancelled); run uninstall again"
         rm -rf "$stage"
     fi
@@ -984,7 +993,7 @@ SCRIPT_END
         find "$STATE" -mindepth 1 -maxdepth 1 ! -name state.tlv ! -name config -exec rm -rf {} +
         say "removed; the tether's pairing key and settings are kept in $STATE"
     else
-        rm -rf "$STATE"
+        rm -rf "$STATE" "$HOME/Library/Application Support/bt-tether-source"
         say "removed everything; on the phone, also remove \"Mac Tether\" from its Bluetooth devices"
     fi
 }
@@ -1004,6 +1013,7 @@ case "${1:-status}" in
     _auto)           cmd_auto_loop ;;
     _watch)          cmd_watch "$2" ;;
     _phones)         paired_phones ;;
+    _access)         agent_has_access ;;
     _update-app)     cmd_update_app ;;
     _install-root)   cmd_install_root ;;
     _install-login)  cmd_install_login ;;
